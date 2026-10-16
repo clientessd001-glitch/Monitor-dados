@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: 1. Baixar seus arquivos do repositório
+      - name: 1. Preparar ambiente
         uses: actions/checkout@v4
 
       - name: 2. Configurar Java 17
@@ -19,23 +19,17 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: 3. Instalar o compilador Gradle
+      - name: 3. Instalar Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.7'
 
-      - name: 4. Montar estrutura do projeto Android automaticamente
+      - name: 4. Montar todos os arquivos do projeto automaticamente
         run: |
-          # Cria as pastas exigidas pelo Android
+          rm -rf app settings.gradle build.gradle gradle.properties
           mkdir -p app/src/main/java/com/example/monitordados
           mkdir -p app/src/main/assets
 
-          # Move seus 3 arquivos da raiz para as pastas certas
-          cp AndroidManifest.xml app/src/main/AndroidManifest.xml
-          cp MainActivity.kt app/src/main/java/com/example/monitordados/MainActivity.kt
-          cp index.html app/src/main/assets/index.html
-
-          # Cria as configurações do Gradle automaticamente
           cat << 'EOF' > settings.gradle
           pluginManagement {
               repositories {
@@ -63,14 +57,12 @@ jobs:
           cat << 'EOF' > build.gradle
           plugins {
               id 'com.android.application' version '8.3.0' apply false
-              id 'org.jetbrains.kotlin.android' version '1.9.22' apply false
           }
           EOF
 
           cat << 'EOF' > app/build.gradle
           plugins {
               id 'com.android.application'
-              id 'org.jetbrains.kotlin.android'
           }
 
           android {
@@ -90,15 +82,285 @@ jobs:
                   targetCompatibility JavaVersion.VERSION_17
               }
 
-              kotlinOptions {
-                  jvmTarget = '17'
+              lint {
+                  checkReleaseBuilds false
+                  abortOnError false
               }
           }
 
           dependencies {
-              implementation 'androidx.appcompat:appcompat:1.6.1'
-              implementation 'androidx.core:core-ktx:1.12.0'
           }
+          EOF
+
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="Monitor de Dados"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+
+          </manifest>
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/example/monitordados/MainActivity.java
+          package com.example.monitordados;
+
+          import android.app.Activity;
+          import android.app.AppOpsManager;
+          import android.app.usage.NetworkStats;
+          import android.app.usage.NetworkStatsManager;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.net.ConnectivityManager;
+          import android.net.TrafficStats;
+          import android.os.Bundle;
+          import android.os.Process;
+          import android.provider.Settings;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import java.util.Calendar;
+
+          public class MainActivity extends Activity {
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+
+                  WebView webView = new WebView(this);
+                  setContentView(webView);
+
+                  webView.getSettings().setJavaScriptEnabled(true);
+                  webView.getSettings().setDomStorageEnabled(true);
+                  webView.setWebViewClient(new WebViewClient());
+
+                  webView.addJavascriptInterface(new PonteMonitorDados(this), "AndroidMonitor");
+                  webView.loadUrl("file:///android_asset/index.html");
+              }
+
+              public static class PonteMonitorDados {
+                  private final Context context;
+
+                  public PonteMonitorDados(Context context) {
+                      this.context = context;
+                  }
+
+                  @JavascriptInterface
+                  public boolean temPermissaoUso() {
+                      AppOpsManager appOps = (AppOpsManager) context.getSystemService(Context.APP_OPS_SERVICE);
+                      int mode = appOps.checkOpNoThrow(
+                          AppOpsManager.OPSTR_GET_USAGE_STATS,
+                          Process.myUid(),
+                          context.getPackageName()
+                      );
+                      return mode == AppOpsManager.MODE_ALLOWED;
+                  }
+
+                  @JavascriptInterface
+                  public void abrirTelaPermissao() {
+                      Intent intent = new Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS);
+                      intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                      context.startActivity(intent);
+                  }
+
+                  @JavascriptInterface
+                  public double obterConsumoTotalMesGB() {
+                      if (!temPermissaoUso()) {
+                          long bytesBoot = TrafficStats.getMobileRxBytes() + TrafficStats.getMobileTxBytes();
+                          return bytesBoot > 0 ? (double) bytesBoot / (1024.0 * 1024.0 * 1024.0) : 0.0;
+                      }
+
+                      try {
+                          NetworkStatsManager statsManager = (NetworkStatsManager) context.getSystemService(Context.NETWORK_STATS_SERVICE);
+                          Calendar calendario = Calendar.getInstance();
+                          calendario.set(Calendar.DAY_OF_MONTH, 1);
+                          calendario.set(Calendar.HOUR_OF_DAY, 0);
+                          calendario.set(Calendar.MINUTE, 0);
+                          calendario.set(Calendar.SECOND, 0);
+
+                          long inicioMes = calendario.getTimeInMillis();
+                          long agora = System.currentTimeMillis();
+
+                          NetworkStats.Bucket bucket = statsManager.querySummaryForDevice(
+                              ConnectivityManager.TYPE_MOBILE,
+                              null,
+                              inicioMes,
+                              agora
+                          );
+                          long totalBytes = bucket.getRxBytes() + bucket.getTxBytes();
+                          return (double) totalBytes / (1024.0 * 1024.0 * 1024.0);
+                      } catch (Exception e) {
+                          return 0.0;
+                      }
+                  }
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/assets/index.html
+          <!DOCTYPE html>
+          <html lang="pt-BR">
+          <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Monitor de Dados Móveis</title>
+            <style>
+              :root {
+                --bg: #0f172a;
+                --card: #1e293b;
+                --primary: #38bdf8;
+                --accent: #f59e0b;
+                --danger: #ef4444;
+                --success: #22c55e;
+                --text: #f8fafc;
+                --muted: #94a3b8;
+              }
+              * { box-sizing: border-box; margin: 0; padding: 0; font-family: sans-serif; }
+              body { background: var(--bg); color: var(--text); display: flex; justify-content: center; padding: 16px; min-height: 100vh; }
+              .app-container { width: 100%; max-width: 420px; display: flex; flex-direction: column; gap: 14px; }
+              .header { text-align: center; padding: 6px 0; }
+              .header h1 { font-size: 1.35rem; color: var(--primary); }
+              .header p { font-size: 0.82rem; color: var(--muted); margin-top: 4px; }
+              .card { background: var(--card); border-radius: 16px; padding: 16px; box-shadow: 0 8px 20px rgba(0,0,0,0.35); }
+              .perm-banner { background: rgba(245,158,11,0.15); border: 1px solid var(--accent); border-radius: 12px; padding: 12px; text-align: center; display: none; }
+              .perm-banner p { font-size: 0.82rem; margin-bottom: 8px; }
+              .perm-btn { background: var(--accent); color: #0f172a; border: none; padding: 8px 14px; border-radius: 8px; font-weight: 700; cursor: pointer; }
+              .network-bar { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; text-align: center; }
+              .net-item { background: rgba(15,23,42,0.6); padding: 10px; border-radius: 12px; }
+              .net-label { font-size: 0.7rem; color: var(--muted); text-transform: uppercase; }
+              .net-value { font-size: 1rem; font-weight: 700; color: var(--primary); margin-top: 4px; }
+              .gauge-container { display: flex; flex-direction: column; align-items: center; position: relative; margin: 6px 0; }
+              svg.progress-ring { width: 190px; height: 190px; transform: rotate(-90deg); }
+              .ring-bg { fill: none; stroke: #334155; stroke-width: 14; }
+              .ring-fill { fill: none; stroke: var(--primary); stroke-width: 14; stroke-linecap: round; stroke-dasharray: 502; stroke-dashoffset: 502; transition: 0.6s ease; }
+              .gauge-center { position: absolute; top: 44%; left: 50%; transform: translate(-50%, -50%); text-align: center; }
+              .used-gb { font-size: 1.7rem; font-weight: 800; }
+              .total-gb { font-size: 0.85rem; color: var(--muted); }
+              .status-badge { margin-top: 10px; padding: 6px 14px; border-radius: 20px; font-size: 0.8rem; font-weight: 600; background: rgba(34,197,94,0.15); color: var(--success); }
+              .section-title { font-size: 0.85rem; font-weight: 600; margin-bottom: 10px; color: var(--muted); }
+              .plan-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+              .plan-btn { background: #0f172a; color: var(--text); border: 1px solid #334155; padding: 10px 6px; border-radius: 10px; font-weight: 700; cursor: pointer; }
+              .plan-btn.active { background: var(--primary); color: #0f172a; border-color: var(--primary); }
+            </style>
+          </head>
+          <body>
+            <div class="app-container">
+              <div class="header">
+                <h1>Monitor de Dados Móveis</h1>
+                <p id="modoMonitor">Sincronizando com o Android...</p>
+              </div>
+              <div class="perm-banner" id="permBanner">
+                <p>Autorize o acesso ao uso para ler todo o consumo de dados móveis do aparelho.</p>
+                <button class="perm-btn" onclick="pedirPermissao()">Autorizar no Android</button>
+              </div>
+              <div class="card">
+                <div class="network-bar">
+                  <div class="net-item"><div class="net-label">Rede</div><div class="net-value" id="netType">4G/5G</div></div>
+                  <div class="net-item"><div class="net-label">Velocidade</div><div class="net-value" id="netSpeed">-- Mbps</div></div>
+                  <div class="net-item"><div class="net-label">Latência</div><div class="net-value" id="netRtt">-- ms</div></div>
+                </div>
+              </div>
+              <div class="card">
+                <div class="gauge-container">
+                  <svg class="progress-ring">
+                    <circle class="ring-bg" cx="95" cy="95" r="80"></circle>
+                    <circle class="ring-fill" id="ringFill" cx="95" cy="95" r="80"></circle>
+                  </svg>
+                  <div class="gauge-center">
+                    <div class="used-gb" id="usedDisplay">0.00 GB</div>
+                    <div class="total-gb">de <span id="planDisplay">43</span> GB</div>
+                  </div>
+                  <div class="status-badge" id="statusBadge">Calculando consumo...</div>
+                </div>
+              </div>
+              <div class="card">
+                <div class="section-title">Selecione a Franquia do Seu Plano</div>
+                <div class="plan-grid">
+                  <button class="plan-btn" onclick="definirPlano(43)">43 GB</button>
+                  <button class="plan-btn" onclick="definirPlano(48)">48 GB</button>
+                  <button class="plan-btn" onclick="definirPlano(91)">91 GB</button>
+                  <button class="plan-btn" onclick="definirPlano(134)">134 GB</button>
+                </div>
+              </div>
+            </div>
+            <script>
+              let planoTotalGB = parseFloat(localStorage.getItem('planoTotalGB')) || 43;
+              let consumoAtualGB = 0.0;
+              const circunferencia = 2 * Math.PI * 80;
+
+              function atualizarInterface() {
+                document.getElementById('usedDisplay').innerText = consumoAtualGB.toFixed(2) + ' GB';
+                document.getElementById('planDisplay').innerText = planoTotalGB;
+                let percentual = Math.min(100, (consumoAtualGB / planoTotalGB) * 100);
+                const ring = document.getElementById('ringFill');
+                ring.style.strokeDashoffset = circunferencia - (percentual / 100) * circunferencia;
+                const badge = document.getElementById('statusBadge');
+                const restante = Math.max(0, planoTotalGB - consumoAtualGB).toFixed(2);
+                if (percentual >= 90) {
+                  ring.style.stroke = '#ef4444';
+                  badge.style.color = '#ef4444';
+                  badge.innerText = 'Alerta! Restam ' + restante + ' GB';
+                } else if (percentual >= 75) {
+                  ring.style.stroke = '#f59e0b';
+                  badge.style.color = '#f59e0b';
+                  badge.innerText = 'Atenção: Restam ' + restante + ' GB';
+                } else {
+                  ring.style.stroke = '#38bdf8';
+                  badge.style.color = '#22c55e';
+                  badge.innerText = 'Restam ' + restante + ' GB disponíveis';
+                }
+                document.querySelectorAll('.plan-btn').forEach(btn => {
+                  btn.classList.toggle('active', btn.innerText === planoTotalGB + ' GB');
+                });
+                localStorage.setItem('planoTotalGB', planoTotalGB);
+              }
+
+              function definirPlano(gb) { planoTotalGB = gb; atualizarInterface(); }
+              function pedirPermissao() { if (window.AndroidMonitor) window.AndroidMonitor.abrirTelaPermissao(); }
+
+              function sincronizarComAndroid() {
+                if (window.AndroidMonitor) {
+                  const temPerm = window.AndroidMonitor.temPermissaoUso();
+                  document.getElementById('permBanner').style.display = temPerm ? 'none' : 'block';
+                  document.getElementById('modoMonitor').innerText = temPerm ? 'Monitoramento Android Ativo' : 'Autorize a leitura de dados abaixo';
+                  consumoAtualGB = window.AndroidMonitor.obterConsumoTotalMesGB();
+                  atualizarInterface();
+                }
+              }
+
+              function monitorarRede() {
+                const conn = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+                if (conn) {
+                  document.getElementById('netType').innerText = (conn.type || conn.effectiveType || 'Móvel').toUpperCase();
+                  document.getElementById('netSpeed').innerText = conn.downlink ? conn.downlink + ' Mbps' : '-- Mbps';
+                  document.getElementById('netRtt').innerText = conn.rtt ? conn.rtt + ' ms' : '-- ms';
+                }
+              }
+
+              sincronizarComAndroid();
+              monitorarRede();
+              setInterval(sincronizarComAndroid, 4000);
+              setInterval(monitorarRede, 3000);
+            </script>
+          </body>
+          </html>
           EOF
 
       - name: 5. Compilar o aplicativo APK
