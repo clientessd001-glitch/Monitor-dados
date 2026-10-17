@@ -73,8 +73,8 @@ jobs:
                   applicationId "com.example.monitordados"
                   minSdk 24
                   targetSdk 34
-                  versionCode 1
-                  versionName "1.0"
+                  versionCode 3
+                  versionName "3.0"
               }
 
               compileOptions {
@@ -129,6 +129,8 @@ jobs:
           import android.content.Context;
           import android.content.Intent;
           import android.net.ConnectivityManager;
+          import android.net.Network;
+          import android.net.NetworkCapabilities;
           import android.net.TrafficStats;
           import android.os.Bundle;
           import android.os.Process;
@@ -136,7 +138,9 @@ jobs:
           import android.webkit.JavascriptInterface;
           import android.webkit.WebView;
           import android.webkit.WebViewClient;
-          import java.util.Calendar;
+          import java.io.InputStream;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
 
           public class MainActivity extends Activity {
 
@@ -157,9 +161,13 @@ jobs:
 
               public static class PonteMonitorDados {
                   private final Context context;
+                  private volatile int ultimoPingMs = 0;
+                  private volatile double ultimaVelocidadeMbps = 0.0;
+                  private volatile boolean medindoRede = false;
 
                   public PonteMonitorDados(Context context) {
                       this.context = context;
+                      dispararMedicaoEmSegundoPlano();
                   }
 
                   @JavascriptInterface
@@ -181,7 +189,108 @@ jobs:
                   }
 
                   @JavascriptInterface
-                  public double obterConsumoTotalMesGB() {
+                  public String obterTipoRede() {
+                      try {
+                          ConnectivityManager cm = (ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
+                          Network net = cm.getActiveNetwork();
+                          if (net == null) return "Offline";
+                          NetworkCapabilities caps = cm.getNetworkCapabilities(net);
+                          if (caps == null) return "Offline";
+                          if (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) return "4G / 5G";
+                          if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return "Wi-Fi";
+                          return "Online";
+                      } catch (Exception e) {
+                          return "Móvel";
+                      }
+                  }
+
+                  @JavascriptInterface
+                  public int obterLatenciaMs() {
+                      return ultimoPingMs;
+                  }
+
+                  @JavascriptInterface
+                  public double obterVelocidadeMbps() {
+                      return ultimaVelocidadeMbps;
+                  }
+
+                  @JavascriptInterface
+                  public void dispararMedicaoEmSegundoPlano() {
+                      if (medindoRede) return;
+                      medindoRede = true;
+
+                      new Thread(() -> {
+                          try {
+                              // 1. Mede a Latência real (Ping em ms)
+                              long tPingInicio = System.currentTimeMillis();
+                              HttpURLConnection connPing = (HttpURLConnection) new URL(
+                                  "https://www.google.com/generate_204?t=" + tPingInicio
+                              ).openConnection();
+                              connPing.setConnectTimeout(3000);
+                              connPing.setReadTimeout(3000);
+                              connPing.setUseCaches(false);
+                              connPing.getResponseCode();
+                              ultimoPingMs = (int) (System.currentTimeMillis() - tPingInicio);
+                              connPing.disconnect();
+
+                              // 2. Mede a Velocidade real de Download (em Mbps)
+                              HttpURLConnection connVel = (HttpURLConnection) new URL(
+                                  "https://speed.cloudflare.com/__down?bytes=200000&t=" + System.currentTimeMillis()
+                              ).openConnection();
+                              connVel.setConnectTimeout(4000);
+                              connVel.setReadTimeout(4000);
+                              connVel.setUseCaches(false);
+                              connVel.connect();
+
+                              long rxAntes = TrafficStats.getTotalRxBytes();
+                              long txAntes = TrafficStats.getTotalTxBytes();
+                              long tInicioNano = System.nanoTime();
+
+                              InputStream in = connVel.getInputStream();
+                              byte[] buffer = new byte[8192];
+                              long bytesBaixados = 0;
+                              int lidos;
+                              while ((lidos = in.read(buffer)) != -1) {
+                                  bytesBaixados += lidos;
+                              }
+                              in.close();
+                              connVel.disconnect();
+
+                              double segundos = (System.nanoTime() - tInicioNano) / 1_000_000_000.0;
+                              long bytesSistema = (TrafficStats.getTotalRxBytes() - rxAntes) + (TrafficStats.getTotalTxBytes() - txAntes);
+                              long totalBytes = Math.max(bytesBaixados, bytesSistema);
+
+                              if (segundos > 0.01) {
+                                  ultimaVelocidadeMbps = (totalBytes * 8.0) / (segundos * 1_000_000.0);
+                              }
+                          } catch (Exception e) {
+                              // Caso o servidor principal oscile, mantém a última leitura ou tenta via Google
+                              try {
+                                  long t0 = System.nanoTime();
+                                  HttpURLConnection fallback = (HttpURLConnection) new URL(
+                                      "https://www.gstatic.com/webp/gallery/1.jpg?t=" + System.currentTimeMillis()
+                                  ).openConnection();
+                                  fallback.setUseCaches(false);
+                                  InputStream in = fallback.getInputStream();
+                                  byte[] buf = new byte[8192];
+                                  long total = 0;
+                                  int n;
+                                  while ((n = in.read(buf)) != -1) total += n;
+                                  in.close();
+                                  fallback.disconnect();
+                                  double seg = (System.nanoTime() - t0) / 1_000_000_000.0;
+                                  if (seg > 0.01) {
+                                      ultimaVelocidadeMbps = (total * 8.0) / (seg * 1_000_000.0);
+                                  }
+                              } catch (Exception ignored) {}
+                          } finally {
+                              medindoRede = false;
+                          }
+                      }).start();
+                  }
+
+                  @JavascriptInterface
+                  public double obterConsumoDesdeMillis(long inicioMillis) {
                       if (!temPermissaoUso()) {
                           long bytesBoot = TrafficStats.getMobileRxBytes() + TrafficStats.getMobileTxBytes();
                           return bytesBoot > 0 ? (double) bytesBoot / (1024.0 * 1024.0 * 1024.0) : 0.0;
@@ -189,19 +298,12 @@ jobs:
 
                       try {
                           NetworkStatsManager statsManager = (NetworkStatsManager) context.getSystemService(Context.NETWORK_STATS_SERVICE);
-                          Calendar calendario = Calendar.getInstance();
-                          calendario.set(Calendar.DAY_OF_MONTH, 1);
-                          calendario.set(Calendar.HOUR_OF_DAY, 0);
-                          calendario.set(Calendar.MINUTE, 0);
-                          calendario.set(Calendar.SECOND, 0);
-
-                          long inicioMes = calendario.getTimeInMillis();
                           long agora = System.currentTimeMillis();
 
                           NetworkStats.Bucket bucket = statsManager.querySummaryForDevice(
                               ConnectivityManager.TYPE_MOBILE,
                               null,
-                              inicioMes,
+                              inicioMillis,
                               agora
                           );
                           long totalBytes = bucket.getRxBytes() + bucket.getTxBytes();
@@ -233,31 +335,37 @@ jobs:
                 --muted: #94a3b8;
               }
               * { box-sizing: border-box; margin: 0; padding: 0; font-family: sans-serif; }
-              body { background: var(--bg); color: var(--text); display: flex; justify-content: center; padding: 16px; min-height: 100vh; }
-              .app-container { width: 100%; max-width: 420px; display: flex; flex-direction: column; gap: 14px; }
-              .header { text-align: center; padding: 6px 0; }
-              .header h1 { font-size: 1.35rem; color: var(--primary); }
-              .header p { font-size: 0.82rem; color: var(--muted); margin-top: 4px; }
-              .card { background: var(--card); border-radius: 16px; padding: 16px; box-shadow: 0 8px 20px rgba(0,0,0,0.35); }
+              body { background: var(--bg); color: var(--text); display: flex; justify-content: center; padding: 14px; min-height: 100vh; }
+              .app-container { width: 100%; max-width: 420px; display: flex; flex-direction: column; gap: 12px; }
+              .header { text-align: center; padding: 4px 0; }
+              .header h1 { font-size: 1.3rem; color: var(--primary); }
+              .header p { font-size: 0.8rem; color: var(--muted); margin-top: 3px; }
+              .card { background: var(--card); border-radius: 16px; padding: 15px; box-shadow: 0 8px 20px rgba(0,0,0,0.35); }
               .perm-banner { background: rgba(245,158,11,0.15); border: 1px solid var(--accent); border-radius: 12px; padding: 12px; text-align: center; display: none; }
-              .perm-banner p { font-size: 0.82rem; margin-bottom: 8px; }
+              .perm-banner p { font-size: 0.8rem; margin-bottom: 8px; }
               .perm-btn { background: var(--accent); color: #0f172a; border: none; padding: 8px 14px; border-radius: 8px; font-weight: 700; cursor: pointer; }
               .network-bar { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; text-align: center; }
-              .net-item { background: rgba(15,23,42,0.6); padding: 10px; border-radius: 12px; }
-              .net-label { font-size: 0.7rem; color: var(--muted); text-transform: uppercase; }
-              .net-value { font-size: 1rem; font-weight: 700; color: var(--primary); margin-top: 4px; }
-              .gauge-container { display: flex; flex-direction: column; align-items: center; position: relative; margin: 6px 0; }
-              svg.progress-ring { width: 190px; height: 190px; transform: rotate(-90deg); }
+              .net-item { background: rgba(15,23,42,0.6); padding: 9px; border-radius: 12px; }
+              .net-label { font-size: 0.68rem; color: var(--muted); text-transform: uppercase; }
+              .net-value { font-size: 0.95rem; font-weight: 700; color: var(--primary); margin-top: 3px; transition: 0.2s; }
+              .speed-btn { width: 100%; margin-top: 10px; background: rgba(56, 189, 248, 0.12); color: var(--primary); border: 1px solid rgba(56, 189, 248, 0.35); padding: 7px; border-radius: 8px; font-size: 0.78rem; font-weight: 600; cursor: pointer; }
+              .gauge-container { display: flex; flex-direction: column; align-items: center; position: relative; margin: 4px 0; }
+              svg.progress-ring { width: 185px; height: 185px; transform: rotate(-90deg); }
               .ring-bg { fill: none; stroke: #334155; stroke-width: 14; }
               .ring-fill { fill: none; stroke: var(--primary); stroke-width: 14; stroke-linecap: round; stroke-dasharray: 502; stroke-dashoffset: 502; transition: 0.6s ease; }
-              .gauge-center { position: absolute; top: 44%; left: 50%; transform: translate(-50%, -50%); text-align: center; }
-              .used-gb { font-size: 1.7rem; font-weight: 800; }
-              .total-gb { font-size: 0.85rem; color: var(--muted); }
-              .status-badge { margin-top: 10px; padding: 6px 14px; border-radius: 20px; font-size: 0.8rem; font-weight: 600; background: rgba(34,197,94,0.15); color: var(--success); }
-              .section-title { font-size: 0.85rem; font-weight: 600; margin-bottom: 10px; color: var(--muted); }
+              .gauge-center { position: absolute; top: 40%; left: 50%; transform: translate(-50%, -50%); text-align: center; }
+              .used-gb { font-size: 1.65rem; font-weight: 800; }
+              .total-gb { font-size: 0.82rem; color: var(--muted); }
+              .status-badge { margin-top: 8px; padding: 6px 14px; border-radius: 20px; font-size: 0.78rem; font-weight: 600; background: rgba(34,197,94,0.15); color: var(--success); }
+              .cycle-info { margin-top: 6px; font-size: 0.75rem; color: var(--muted); text-align: center; }
+              .section-title { font-size: 0.82rem; font-weight: 600; margin-bottom: 8px; color: var(--muted); }
               .plan-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
-              .plan-btn { background: #0f172a; color: var(--text); border: 1px solid #334155; padding: 10px 6px; border-radius: 10px; font-weight: 700; cursor: pointer; }
+              .plan-btn { background: #0f172a; color: var(--text); border: 1px solid #334155; padding: 9px 6px; border-radius: 10px; font-weight: 700; cursor: pointer; }
               .plan-btn.active { background: var(--primary); color: #0f172a; border-color: var(--primary); }
+              .row-controls { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }
+              .input-box { flex: 1; background: #0f172a; color: var(--text); border: 1px solid #334155; padding: 9px 10px; border-radius: 10px; font-size: 0.85rem; }
+              .action-btn { background: var(--primary); color: #0f172a; border: none; padding: 9px 14px; border-radius: 10px; font-weight: 700; font-size: 0.82rem; cursor: pointer; }
+              .zero-btn { width: 100%; background: rgba(56, 189, 248, 0.12); color: var(--primary); border: 1px solid var(--primary); padding: 10px; border-radius: 10px; font-weight: 700; font-size: 0.82rem; cursor: pointer; }
             </style>
           </head>
           <body>
@@ -266,32 +374,38 @@ jobs:
                 <h1>Monitor de Dados Móveis</h1>
                 <p id="modoMonitor">Sincronizando com o Android...</p>
               </div>
+
               <div class="perm-banner" id="permBanner">
                 <p>Autorize o acesso ao uso para ler todo o consumo de dados móveis do aparelho.</p>
                 <button class="perm-btn" onclick="pedirPermissao()">Autorizar no Android</button>
               </div>
+
               <div class="card">
                 <div class="network-bar">
-                  <div class="net-item"><div class="net-label">Rede</div><div class="net-value" id="netType">4G/5G</div></div>
-                  <div class="net-item"><div class="net-label">Velocidade</div><div class="net-value" id="netSpeed">-- Mbps</div></div>
-                  <div class="net-item"><div class="net-label">Latência</div><div class="net-value" id="netRtt">-- ms</div></div>
+                  <div class="net-item"><div class="net-label">Rede</div><div class="net-value" id="netType">Detectando...</div></div>
+                  <div class="net-item"><div class="net-label">Velocidade</div><div class="net-value" id="netSpeed">Medindo...</div></div>
+                  <div class="net-item"><div class="net-label">Latência</div><div class="net-value" id="netRtt">Medindo...</div></div>
                 </div>
+                <button class="speed-btn" id="btnSpeedTest" onclick="testarVelocidadeManual()">↻ Atualizar Teste de Velocidade e Ping</button>
               </div>
+
               <div class="card">
                 <div class="gauge-container">
                   <svg class="progress-ring">
-                    <circle class="ring-bg" cx="95" cy="95" r="80"></circle>
-                    <circle class="ring-fill" id="ringFill" cx="95" cy="95" r="80"></circle>
+                    <circle class="ring-bg" cx="92" cy="92" r="80"></circle>
+                    <circle class="ring-fill" id="ringFill" cx="92" cy="92" r="80"></circle>
                   </svg>
                   <div class="gauge-center">
                     <div class="used-gb" id="usedDisplay">0.00 GB</div>
                     <div class="total-gb">de <span id="planDisplay">43</span> GB</div>
                   </div>
                   <div class="status-badge" id="statusBadge">Calculando consumo...</div>
+                  <div class="cycle-info" id="cycleInfo">Contando desde: 01/10</div>
                 </div>
               </div>
+
               <div class="card">
-                <div class="section-title">Selecione a Franquia do Seu Plano</div>
+                <div class="section-title">1. Franquia do Plano</div>
                 <div class="plan-grid">
                   <button class="plan-btn" onclick="definirPlano(43)">43 GB</button>
                   <button class="plan-btn" onclick="definirPlano(48)">48 GB</button>
@@ -299,20 +413,71 @@ jobs:
                   <button class="plan-btn" onclick="definirPlano(134)">134 GB</button>
                 </div>
               </div>
+
+              <div class="card">
+                <div class="section-title">2. Período de Renovação do Chip</div>
+                <div class="row-controls">
+                  <input type="number" id="diaRenovacaoInput" class="input-box" min="1" max="31" placeholder="Dia de renovação (1 a 31)">
+                  <button class="action-btn" onclick="salvarDiaRenovacao()">Salvar Dia</button>
+                </div>
+                <button class="zero-btn" onclick="zerarCicloAgora()">Zerar / Iniciar Ciclo Agora (0.00 GB)</button>
+              </div>
             </div>
+
             <script>
               let planoTotalGB = parseFloat(localStorage.getItem('planoTotalGB')) || 43;
+              let diaRenovacao = parseInt(localStorage.getItem('diaRenovacao')) || 1;
+              let resetManualMillis = parseInt(localStorage.getItem('resetManualMillis')) || 0;
               let consumoAtualGB = 0.0;
               const circunferencia = 2 * Math.PI * 80;
+
+              document.getElementById('diaRenovacaoInput').value = diaRenovacao;
+
+              function calcularInicioAutomatico() {
+                const agora = new Date();
+                let ano = agora.getFullYear();
+                let mes = agora.getMonth();
+
+                if (agora.getDate() < diaRenovacao) {
+                  mes -= 1;
+                  if (mes < 0) {
+                    mes = 11;
+                    ano -= 1;
+                  }
+                }
+                const ultimoDiaMes = new Date(ano, mes + 1, 0).getDate();
+                const diaReal = Math.min(diaRenovacao, ultimoDiaMes);
+                return new Date(ano, mes, diaReal, 0, 0, 0, 0).getTime();
+              }
+
+              function obterInicioEfetivoMillis() {
+                const inicioAuto = calcularInicioAutomatico();
+                if (resetManualMillis > inicioAuto) {
+                  return resetManualMillis;
+                }
+                return inicioAuto;
+              }
+
+              function formatarDataHora(millis) {
+                const d = new Date(millis);
+                const dia = String(d.getDate()).padStart(2, '0');
+                const mes = String(d.getMonth() + 1).padStart(2, '0');
+                const hora = String(d.getHours()).padStart(2, '0');
+                const min = String(d.getMinutes()).padStart(2, '0');
+                return `${dia}/${mes} às ${hora}:${min}`;
+              }
 
               function atualizarInterface() {
                 document.getElementById('usedDisplay').innerText = consumoAtualGB.toFixed(2) + ' GB';
                 document.getElementById('planDisplay').innerText = planoTotalGB;
+
                 let percentual = Math.min(100, (consumoAtualGB / planoTotalGB) * 100);
                 const ring = document.getElementById('ringFill');
                 ring.style.strokeDashoffset = circunferencia - (percentual / 100) * circunferencia;
+
                 const badge = document.getElementById('statusBadge');
                 const restante = Math.max(0, planoTotalGB - consumoAtualGB).toFixed(2);
+
                 if (percentual >= 90) {
                   ring.style.stroke = '#ef4444';
                   badge.style.color = '#ef4444';
@@ -326,38 +491,88 @@ jobs:
                   badge.style.color = '#22c55e';
                   badge.innerText = 'Restam ' + restante + ' GB disponíveis';
                 }
+
+                const inicioMillis = obterInicioEfetivoMillis();
+                document.getElementById('cycleInfo').innerText =
+                  `Contando desde: ${formatarDataHora(inicioMillis)} (Renova todo dia ${diaRenovacao})`;
+
                 document.querySelectorAll('.plan-btn').forEach(btn => {
                   btn.classList.toggle('active', btn.innerText === planoTotalGB + ' GB');
                 });
+
                 localStorage.setItem('planoTotalGB', planoTotalGB);
               }
 
-              function definirPlano(gb) { planoTotalGB = gb; atualizarInterface(); }
-              function pedirPermissao() { if (window.AndroidMonitor) window.AndroidMonitor.abrirTelaPermissao(); }
+              function definirPlano(gb) {
+                planoTotalGB = gb;
+                atualizarInterface();
+              }
+
+              function salvarDiaRenovacao() {
+                const val = parseInt(document.getElementById('diaRenovacaoInput').value);
+                if (val >= 1 && val <= 31) {
+                  diaRenovacao = val;
+                  resetManualMillis = 0;
+                  localStorage.setItem('diaRenovacao', diaRenovacao);
+                  localStorage.setItem('resetManualMillis', 0);
+                  sincronizarComAndroid();
+                }
+              }
+
+              function zerarCicloAgora() {
+                resetManualMillis = Date.now();
+                localStorage.setItem('resetManualMillis', resetManualMillis);
+                sincronizarComAndroid();
+              }
+
+              function pedirPermissao() {
+                if (window.AndroidMonitor) window.AndroidMonitor.abrirTelaPermissao();
+              }
 
               function sincronizarComAndroid() {
+                const inicioMillis = obterInicioEfetivoMillis();
                 if (window.AndroidMonitor) {
                   const temPerm = window.AndroidMonitor.temPermissaoUso();
                   document.getElementById('permBanner').style.display = temPerm ? 'none' : 'block';
-                  document.getElementById('modoMonitor').innerText = temPerm ? 'Monitoramento Android Ativo' : 'Autorize a leitura de dados abaixo';
-                  consumoAtualGB = window.AndroidMonitor.obterConsumoTotalMesGB();
-                  atualizarInterface();
+                  document.getElementById('modoMonitor').innerText = temPerm
+                    ? 'Monitoramento Android Ativo'
+                    : 'Autorize a leitura de dados abaixo';
+                  consumoAtualGB = window.AndroidMonitor.obterConsumoDesdeMillis(inicioMillis);
+                }
+                atualizarInterface();
+              }
+
+              function atualizarMedidoresRede() {
+                if (window.AndroidMonitor) {
+                  // Pede ao Android uma nova medição em segundo plano
+                  window.AndroidMonitor.dispararMedicaoEmSegundoPlano();
+
+                  const tipo = window.AndroidMonitor.obterTipoRede();
+                  const ping = window.AndroidMonitor.obterLatenciaMs();
+                  const vel = window.AndroidMonitor.obterVelocidadeMbps();
+
+                  document.getElementById('netType').innerText = tipo;
+                  document.getElementById('netRtt').innerText = ping > 0 ? ping + ' ms' : '...';
+                  document.getElementById('netSpeed').innerText = vel > 0 ? vel.toFixed(1) + ' Mbps' : '...';
                 }
               }
 
-              function monitorarRede() {
-                const conn = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
-                if (conn) {
-                  document.getElementById('netType').innerText = (conn.type || conn.effectiveType || 'Móvel').toUpperCase();
-                  document.getElementById('netSpeed').innerText = conn.downlink ? conn.downlink + ' Mbps' : '-- Mbps';
-                  document.getElementById('netRtt').innerText = conn.rtt ? conn.rtt + ' ms' : '-- ms';
+              function testarVelocidadeManual() {
+                const btn = document.getElementById('btnSpeedTest');
+                btn.innerText = 'Medindo velocidade ao vivo...';
+                if (window.AndroidMonitor) {
+                  window.AndroidMonitor.dispararMedicaoEmSegundoPlano();
                 }
+                setTimeout(() => {
+                  atualizarMedidoresRede();
+                  btn.innerText = '↻ Atualizar Teste de Velocidade e Ping';
+                }, 1500);
               }
 
               sincronizarComAndroid();
-              monitorarRede();
+              atualizarMedidoresRede();
               setInterval(sincronizarComAndroid, 4000);
-              setInterval(monitorarRede, 3000);
+              setInterval(atualizarMedidoresRede, 3500);
             </script>
           </body>
           </html>
