@@ -73,8 +73,8 @@ jobs:
                   applicationId "com.example.monitordados"
                   minSdk 24
                   targetSdk 34
-                  versionCode 3
-                  versionName "3.0"
+                  versionCode 4
+                  versionName "4.0"
               }
 
               compileOptions {
@@ -93,7 +93,6 @@ jobs:
           EOF
 
           cat << 'EOF' > app/src/main/AndroidManifest.xml
-          <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
               <uses-permission android:name="android.permission.INTERNET" />
@@ -221,7 +220,6 @@ jobs:
 
                       new Thread(() -> {
                           try {
-                              // 1. Mede a Latência real (Ping em ms)
                               long tPingInicio = System.currentTimeMillis();
                               HttpURLConnection connPing = (HttpURLConnection) new URL(
                                   "https://www.google.com/generate_204?t=" + tPingInicio
@@ -233,7 +231,6 @@ jobs:
                               ultimoPingMs = (int) (System.currentTimeMillis() - tPingInicio);
                               connPing.disconnect();
 
-                              // 2. Mede a Velocidade real de Download (em Mbps)
                               HttpURLConnection connVel = (HttpURLConnection) new URL(
                                   "https://speed.cloudflare.com/__down?bytes=200000&t=" + System.currentTimeMillis()
                               ).openConnection();
@@ -264,7 +261,6 @@ jobs:
                                   ultimaVelocidadeMbps = (totalBytes * 8.0) / (segundos * 1_000_000.0);
                               }
                           } catch (Exception e) {
-                              // Caso o servidor principal oscile, mantém a última leitura ou tenta via Google
                               try {
                                   long t0 = System.nanoTime();
                                   HttpURLConnection fallback = (HttpURLConnection) new URL(
@@ -355,10 +351,12 @@ jobs:
               .ring-fill { fill: none; stroke: var(--primary); stroke-width: 14; stroke-linecap: round; stroke-dasharray: 502; stroke-dashoffset: 502; transition: 0.6s ease; }
               .gauge-center { position: absolute; top: 40%; left: 50%; transform: translate(-50%, -50%); text-align: center; }
               .used-gb { font-size: 1.65rem; font-weight: 800; }
-              .total-gb { font-size: 0.82rem; color: var(--muted); }
+              .total-gb { font-size: 0.82rem; color: var(--muted); margin-top: 2px; }
               .status-badge { margin-top: 8px; padding: 6px 14px; border-radius: 20px; font-size: 0.78rem; font-weight: 600; background: rgba(34,197,94,0.15); color: var(--success); }
               .cycle-info { margin-top: 6px; font-size: 0.75rem; color: var(--muted); text-align: center; }
               .section-title { font-size: 0.82rem; font-weight: 600; margin-bottom: 8px; color: var(--muted); }
+              .unlimited-btn { width: 100%; margin-bottom: 8px; background: #0f172a; color: var(--text); border: 1px solid #334155; padding: 11px; border-radius: 10px; font-weight: 800; font-size: 0.9rem; cursor: pointer; letter-spacing: 0.3px; }
+              .unlimited-btn.active { background: var(--primary); color: #0f172a; border-color: var(--primary); }
               .plan-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
               .plan-btn { background: #0f172a; color: var(--text); border: 1px solid #334155; padding: 9px 6px; border-radius: 10px; font-weight: 700; cursor: pointer; }
               .plan-btn.active { background: var(--primary); color: #0f172a; border-color: var(--primary); }
@@ -397,7 +395,7 @@ jobs:
                   </svg>
                   <div class="gauge-center">
                     <div class="used-gb" id="usedDisplay">0.00 GB</div>
-                    <div class="total-gb">de <span id="planDisplay">43</span> GB</div>
+                    <div class="total-gb" id="planLabel">Plano Ilimitado</div>
                   </div>
                   <div class="status-badge" id="statusBadge">Calculando consumo...</div>
                   <div class="cycle-info" id="cycleInfo">Contando desde: 01/10</div>
@@ -406,6 +404,7 @@ jobs:
 
               <div class="card">
                 <div class="section-title">1. Franquia do Plano</div>
+                <button class="unlimited-btn" id="btnIlimitado" onclick="definirPlano(0)">∞ PLANO ILIMITADO</button>
                 <div class="plan-grid">
                   <button class="plan-btn" onclick="definirPlano(43)">43 GB</button>
                   <button class="plan-btn" onclick="definirPlano(48)">48 GB</button>
@@ -425,7 +424,9 @@ jobs:
             </div>
 
             <script>
-              let planoTotalGB = parseFloat(localStorage.getItem('planoTotalGB')) || 43;
+              // 0 representa o Plano Ilimitado (definido como padrão)
+              let salvo = localStorage.getItem('planoTotalGB');
+              let planoTotalGB = salvo !== null ? parseFloat(salvo) : 0;
               let diaRenovacao = parseInt(localStorage.getItem('diaRenovacao')) || 1;
               let resetManualMillis = parseInt(localStorage.getItem('resetManualMillis')) || 0;
               let consumoAtualGB = 0.0;
@@ -469,33 +470,44 @@ jobs:
 
               function atualizarInterface() {
                 document.getElementById('usedDisplay').innerText = consumoAtualGB.toFixed(2) + ' GB';
-                document.getElementById('planDisplay').innerText = planoTotalGB;
-
-                let percentual = Math.min(100, (consumoAtualGB / planoTotalGB) * 100);
+                const planLabel = document.getElementById('planLabel');
                 const ring = document.getElementById('ringFill');
-                ring.style.strokeDashoffset = circunferencia - (percentual / 100) * circunferencia;
-
                 const badge = document.getElementById('statusBadge');
-                const restante = Math.max(0, planoTotalGB - consumoAtualGB).toFixed(2);
 
-                if (percentual >= 90) {
-                  ring.style.stroke = '#ef4444';
-                  badge.style.color = '#ef4444';
-                  badge.innerText = 'Alerta! Restam ' + restante + ' GB';
-                } else if (percentual >= 75) {
-                  ring.style.stroke = '#f59e0b';
-                  badge.style.color = '#f59e0b';
-                  badge.innerText = 'Atenção: Restam ' + restante + ' GB';
-                } else {
+                if (planoTotalGB === 0) {
+                  // Modo Plano Ilimitado
+                  planLabel.innerText = 'Plano Ilimitado';
                   ring.style.stroke = '#38bdf8';
+                  ring.style.strokeDashoffset = 0; // Anel completo indicando uso livre
                   badge.style.color = '#22c55e';
-                  badge.innerText = 'Restam ' + restante + ' GB disponíveis';
+                  badge.innerText = 'Uso Livre • Franquia Ilimitada';
+                } else {
+                  // Modo Franquia em GB
+                  planLabel.innerText = 'de ' + planoTotalGB + ' GB';
+                  let percentual = Math.min(100, (consumoAtualGB / planoTotalGB) * 100);
+                  ring.style.strokeDashoffset = circunferencia - (percentual / 100) * circunferencia;
+                  const restante = Math.max(0, planoTotalGB - consumoAtualGB).toFixed(2);
+
+                  if (percentual >= 90) {
+                    ring.style.stroke = '#ef4444';
+                    badge.style.color = '#ef4444';
+                    badge.innerText = 'Alerta! Restam ' + restante + ' GB';
+                  } else if (percentual >= 75) {
+                    ring.style.stroke = '#f59e0b';
+                    badge.style.color = '#f59e0b';
+                    badge.innerText = 'Atenção: Restam ' + restante + ' GB';
+                  } else {
+                    ring.style.stroke = '#38bdf8';
+                    badge.style.color = '#22c55e';
+                    badge.innerText = 'Restam ' + restante + ' GB disponíveis';
+                  }
                 }
 
                 const inicioMillis = obterInicioEfetivoMillis();
                 document.getElementById('cycleInfo').innerText =
                   `Contando desde: ${formatarDataHora(inicioMillis)} (Renova todo dia ${diaRenovacao})`;
 
+                document.getElementById('btnIlimitado').classList.toggle('active', planoTotalGB === 0);
                 document.querySelectorAll('.plan-btn').forEach(btn => {
                   btn.classList.toggle('active', btn.innerText === planoTotalGB + ' GB');
                 });
@@ -544,7 +556,6 @@ jobs:
 
               function atualizarMedidoresRede() {
                 if (window.AndroidMonitor) {
-                  // Pede ao Android uma nova medição em segundo plano
                   window.AndroidMonitor.dispararMedicaoEmSegundoPlano();
 
                   const tipo = window.AndroidMonitor.obterTipoRede();
